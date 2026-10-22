@@ -62,7 +62,7 @@ from cascade import (
 #   途中で止めても、もう一度実行すれば続きから再開する。
 #   (samples.csv と rounds.csv、stop_pred/ を読み直す。範囲や設定を変えたら OUT_DIR を変える)
 #
-#   出力 (study/cascade_active_sim/):
+#   出力 (study/cascade_active_sim/。random なら _random、AL_SEED が 0 以外なら _seed<N> を付ける):
 #     samples.csv          : シミュレーションした点 (cascade.py と同じ列 + round, role, pred_before)
 #     failed.csv           : シミュレーションに失敗した点
 #     rounds.csv           : ラウンドごとの点数、change_rate、est_err、test_acc、時間
@@ -74,6 +74,13 @@ from cascade import (
 #     AL_TARGET   : 停止する change_rate のしきい値 (既定 0.003)
 #     AL_BUDGET   : シミュレーション回数の上限
 #     AL_TEST     : 0 にすると既存グリッドでの評価をしない
+#     AL_SEED     : 乱数の種 (既定 0)。初期サンプル・候補点・停止判定用の点・MLP の初期値が変わる
+#     AL_STRATEGY : active (既定) / random。random は比較用で、追加点をすべて一様ランダムに選ぶ
+#                   (設計空間・MLP・評価は active と同じ)。random では change_rate で止めず、
+#                   AL_STOP_ACC か AL_BUDGET で止める
+#     AL_STOP_ACC : 既存グリッドでの accuracy がこの値以上になったら止める (比較実験用。
+#                   random の既定 0.9957 = active (seed 0) の停止時。active では既定なし)
+#     AL_GROWTH   : 1ラウンドの追加点数の増え方 (既定 0.1。random の既定 0.2)
 #     NUM_WORKERS : ngspice の並列数 (cascade.py と同じ。既定は CPU コア数)
 #     WORK_DIR    : 作業用ネットリストを置く親フォルダ (cascade.py と同じ)
 # ============================================================
@@ -83,9 +90,19 @@ from cascade import (
 # パス
 # ============================================================
 
+# 乱数の種 (0 のときは今までと同じ結果・同じフォルダになる)
+SEED = int(os.environ.get("AL_SEED", 0))
+
+# 点の選び方 (active: 能動学習, random: 比較用の一様ランダム)
+STRATEGY = os.environ.get("AL_STRATEGY", "active")
+if STRATEGY not in ("active", "random"):
+    raise ValueError(f"AL_STRATEGY は active か random: {STRATEGY}")
+
 OUT_DIR = os.path.join(
     STUDY_DIR,
     "cascade_active_sim"
+    + ("_random" if STRATEGY == "random" else "")
+    + (f"_seed{SEED}" if SEED else "")
 )
 
 SAMPLES_PATH = os.path.join(OUT_DIR, "samples.csv")
@@ -142,10 +159,19 @@ N_INIT = 1000
 
 # 1ラウンドで追加する点数 = max(BATCH, それまでの点数 × BATCH_GROWTH)
 BATCH = 1000
-BATCH_GROWTH = 0.1
+BATCH_GROWTH = float(os.environ.get(
+    "AL_GROWTH", 0.2 if STRATEGY == "random" else 0.1
+))
 
 # シミュレーション回数の上限 (change_rate で止まらなかった場合)
-BUDGET = int(os.environ.get("AL_BUDGET", 60000))
+# random は active と同じ精度まで多くの点が要るので、上限を大きくしておく
+BUDGET = int(os.environ.get(
+    "AL_BUDGET", 1_000_000 if STRATEGY == "random" else 60000
+))
+
+# 既存グリッドでの accuracy がこの値以上になったら止める (比較実験用。None なら使わない)
+_stop_acc = os.environ.get("AL_STOP_ACC", "0.9957" if STRATEGY == "random" else "")
+STOP_ACC = float(_stop_acc) if _stop_acc else None
 
 # 停止条件: change_rate が TARGET_ERR を STOP_PATIENCE ラウンド続けて下回ったら止める
 TARGET_ERR = float(os.environ.get("AL_TARGET", 0.0030))
@@ -176,7 +202,8 @@ PREDICT_CHUNK = 500_000
 USE_TEST = os.environ.get("AL_TEST", "1") != "0"
 TEST_SAMPLES = 1_000_000
 
-SEED = 0
+# 評価用グリッドの間引き方は種によらず固定する (種どうしで同じ行で比べるため)
+TEST_SEED = 0
 
 
 # ============================================================
@@ -442,7 +469,11 @@ def load_samples():
     if not os.path.exists(SAMPLES_PATH):
         return None
 
-    df = pd.read_csv(SAMPLES_PATH)
+    # 学習と est_err に使う列だけ読む (random では行数が多くなるため)
+    df = pd.read_csv(
+        SAMPLES_PATH,
+        usecols=PARAM_KEYS + [LABEL, "round", "role", "pred_before"],
+    )
     df = df.dropna(subset=PARAM_KEYS + [LABEL])
 
     return df if len(df) else None
@@ -497,7 +528,7 @@ def load_test():
     df = df[inside]
 
     if len(df) > TEST_SAMPLES:
-        df = df.sample(n=TEST_SAMPLES, random_state=SEED)
+        df = df.sample(n=TEST_SAMPLES, random_state=TEST_SEED)
 
     print(f"評価用グリッド: {len(df)} 行 (飽和率 {df[LABEL].mean():.3f})")
 
@@ -571,8 +602,12 @@ def main():
     rounds = load_rounds()
 
     print(
-        f"停止条件: change_rate < {TARGET_ERR} が {STOP_PATIENCE} ラウンド連続, "
-        f"上限 {BUDGET} 回, 並列数 {num_workers}"
+        f"方法 {STRATEGY}, 種 {SEED}, 出力先 {OUT_DIR}\n"
+        f"停止条件: "
+        + (f"change_rate < {TARGET_ERR} が {STOP_PATIENCE} ラウンド連続, "
+           if STRATEGY == "active" else "")
+        + (f"グリッドでの accuracy >= {STOP_ACC}, " if STOP_ACC else "")
+        + f"上限 {BUDGET} 回, 並列数 {num_workers}"
     )
     if samples is not None:
         print(f"再開: シミュレーション済み {len(samples)} 点, "
@@ -620,7 +655,9 @@ def main():
                 if y.min() == y.max():
                     models = None
                 else:
-                    models = fit_ensemble(X, y, SEED + rnd, ENSEMBLE_SIZE)
+                    # 種とラウンドの組で初期値を決める (SEED + rnd だと種どうしで重なる)
+                    models = fit_ensemble(X, y, SEED * 1000 + rnd,
+                                          ENSEMBLE_SIZE)
                 t_fit = time.perf_counter() - t0
 
                 est_err, n_est = estimate_error(samples, rnd)
@@ -667,11 +704,17 @@ def main():
                 )
 
                 # 停止判定: 直近 STOP_PATIENCE ラウンドの change_rate がすべて TARGET_ERR 未満
+                # (random は比較用なので change_rate では止めない)
                 recent = [r["change_rate"] for r in rounds[-STOP_PATIENCE:]]
-                if (len(recent) == STOP_PATIENCE
+                if (STRATEGY == "active"
+                        and len(recent) == STOP_PATIENCE
                         and all(c < TARGET_ERR for c in recent)):
                     print(f"\n停止: change_rate < {TARGET_ERR} が "
                           f"{STOP_PATIENCE} ラウンド続いた")
+                    break
+
+                if STOP_ACC is not None and row["test_acc"] >= STOP_ACC:
+                    print(f"\n停止: 既存グリッドでの accuracy が {STOP_ACC} に達した")
                     break
 
                 if len(samples) >= BUDGET:
@@ -685,10 +728,12 @@ def main():
                 )
                 rng = np.random.default_rng([SEED, rnd + 1])
 
-                if models is None:
+                if models is None or STRATEGY == "random":
                     P = sample_space(rng, n_add)
                     roles = ["random"] * len(P)
-                    preds = np.full(len(P), np.nan)
+                    # シミュレーション前の予測 (est_err 用)
+                    preds = (np.full(len(P), np.nan) if models is None
+                             else predict_ensemble(models, to_features(P)))
                 else:
                     P_act, P_rand = select_active(rng, models, n_add)
                     P = np.r_[P_act, P_rand]

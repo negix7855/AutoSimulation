@@ -80,7 +80,7 @@ STUDY_DIR = _tota.STUDY_DIR
 #                   (設計空間・MLP・評価は active と同じ)。random では change_rate で止めず、
 #                   AL_STOP_ACC か AL_BUDGET で止める
 #     AL_STOP_ACC : 既存グリッドでの accuracy がこの値以上になったら止める (比較実験用。
-#                   random の既定 0.9956 = 全データ MLP。active では既定なし)
+#                   random の既定 0.9970 = active (seed 0) の停止時。active では既定なし)
 #     AL_GROWTH   : 1ラウンドの追加点数の増え方 (既定 0.1。random の既定 0.2)
 #     NUM_WORKERS : ngspice の並列数 (5TOTA.py と同じ。既定は CPU コア数)
 #     WORK_DIR    : 作業用ネットリストを置く親フォルダ (5TOTA.py と同じ)
@@ -167,7 +167,7 @@ BUDGET = int(os.environ.get(
 ))
 
 # 既存グリッドでの accuracy がこの値以上になったら止める (比較実験用。None なら使わない)
-_stop_acc = os.environ.get("AL_STOP_ACC", "0.9956" if STRATEGY == "random" else "")
+_stop_acc = os.environ.get("AL_STOP_ACC", "0.9970" if STRATEGY == "random" else "")
 STOP_ACC = float(_stop_acc) if _stop_acc else None
 
 # 停止条件: change_rate が TARGET_ERR を STOP_PATIENCE ラウンド続けて下回ったら止める
